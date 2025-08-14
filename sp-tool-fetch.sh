@@ -33,9 +33,12 @@ EOF
 }
 
 # ---------- OS detect ----------
+# ------------- OS + installers -------------
+USE_SUDO="auto"   # "auto" (Linux package managers may use sudo), "never"
 OS_FAMILY="${OS_FAMILY:-}"
+
 detect_os_family() {
-  [[ -n "$OS_FAMILY" ]] && return 0
+  if [[ -n "$OS_FAMILY" ]]; then return 0; fi
   local u; u="$(uname -s 2>/dev/null || true)"
   case "$u" in
     Darwin) OS_FAMILY="macos" ;;
@@ -56,6 +59,22 @@ detect_os_family() {
     *) OS_FAMILY="unknown" ;;
   esac
 }
+
+run_pkg() {
+  # Use sudo for system package managers on Linux when allowed; never for Homebrew.
+  if [[ "$USE_SUDO" == "auto" ]]; then
+    if [[ $EUID -eq 0 ]]; then
+      "$@"
+    elif command -v sudo >/dev/null 2>&1; then
+      sudo "$@"
+    else
+      "$@"
+    fi
+  else
+    "$@"
+  fi
+}
+
 
 # ---------- Installers (no sudo) ----------
 brew_install() { brew "$@" ; }   # never sudo
@@ -104,34 +123,58 @@ ensure_extractor_installed() {
 install_deps() {
   detect_os_family
   local family="${1:-$OS_FAMILY}"
-  log "Installing dependencies for: $family (no sudo)"
+  log "Installing dependencies for: $family (sudo mode: $USE_SUDO)"
 
   case "$family" in
     macos)
       if ! have brew; then
-        fail "Homebrew not found. Please install from https://brew.sh (no sudo) and re-run --install-deps."
+        fail "Homebrew not found. Install from https://brew.sh (no sudo) and re-run --install-deps."
       fi
+      # Never run brew with sudo
       brew_install update || true
       brew_install install jq wget go node || true
       ;;
-    debian|fedora|arch)
-      log "On Linux without sudo: we cannot install jq/curl/wget for you."
-      log "We will still attempt user-space installs for 'car' and/or 'ipfs-car'."
+
+    debian)
+      # On Linux we allow sudo for system packages unless --no-sudo was passed
+      run_pkg apt-get update -y
+      run_pkg apt-get install -y curl jq wget nodejs npm golang-go || true
       ;;
+
+    fedora)
+      if command -v dnf >/dev/null 2>&1; then
+        run_pkg dnf install -y curl jq wget nodejs npm golang || true
+      else
+        run_pkg yum install -y curl jq wget nodejs npm golang || true
+      fi
+      ;;
+
+    arch)
+      run_pkg pacman -Sy --noconfirm curl jq wget nodejs npm go || true
+      ;;
+
     windows)
       log "Windows detected. Please install: curl, jq, Node.js (for ipfs-car) or Go (for car)."
+      log "Example (winget): winget install -e --id JQLang.jq ; winget install OpenJS.NodeJS.LTS ; winget install GoLang.Go"
       ;;
+
     *)
-      log "Unknown OS. Ensure curl, jq, and either Go (for 'car') or Node.js (for 'ipfs-car')."
+      log "Unknown OS. Please ensure: curl, jq, and either Node.js (ipfs-car) or Go (car)."
       ;;
   esac
 
-  # must-haves for our flows:
-  have curl || fail "curl missing. Please install it."
-  have jq   || fail "jq missing. Please install it."
+  # Ensure a CAR extractor exists (user-space installs; no sudo)
   ensure_extractor_installed || fail "Could not install a CAR extractor (car or ipfs-car)."
-  have wget || log "Note: wget not found; will use curl for downloads."
+
+  # Final checks
+  have curl || fail "curl missing after install attempts."
+  have jq   || fail "jq missing after install attempts."
+  if ! (have car || have ipfs-car); then
+    fail "No car/ipfs-car found after install attempts."
+  fi
+  have wget || log "Note: wget not installed; script will use curl for downloads."
 }
+
 
 # ---------- URL extraction ----------
 extract_first_url_from_json() {
