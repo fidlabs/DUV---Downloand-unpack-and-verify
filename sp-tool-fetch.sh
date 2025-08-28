@@ -107,7 +107,7 @@ ensure_extractor_installed() {
     local go_bin; go_bin="$(go env GOBIN 2>/dev/null || true)"
     [[ -z "$go_bin" || "$go_bin" == "''" ]] && go_bin="$(go env GOPATH 2>/dev/null)/bin"
     [[ -z "$go_bin" ]] && go_bin="$HOME/go/bin"
-    GOBIN="$go_bin" go install github.com/ipld/go-car/cmd/car@latest || true
+    GOBIN="$go_bin" go install https://github.com/kacperzuk-neti/go-car || true
     if [[ -x "$go_bin/car" ]]; then export PATH="$go_bin:$PATH"; return 0; fi
   fi
 
