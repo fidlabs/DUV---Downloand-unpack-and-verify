@@ -25,7 +25,6 @@ Usage:
   [--allow-copy]  # allow real copy if fast clone/reflink unsupported (uses disk space/time)
 
 Notes:
-  - No sudo is used anywhere.
   - macOS: uses Homebrew (non-sudo) if available. ipfs-car installs to user prefix if needed.
   - Linux: jq/curl/wget may need system install; we try user-level installs for ipfs-car and car.
   - Unpack safely clones then fixes padded/zero-length CARv1 without touching the original.
@@ -76,7 +75,7 @@ run_pkg() {
 }
 
 
-# ---------- Installers (no sudo) ----------
+# ---------- Installers ----------
 brew_install() { brew "$@" ; }   # never sudo
 
 npm_global_install() {
@@ -118,6 +117,31 @@ ensure_extractor_installed() {
   fi
 
   return 1
+}
+
+# --- install the tolerant fork: github.com/kacperzuk-neti/go-car ---
+ensure_kcar_installed() {
+  # installs a separate CLI named 'car-pad' into ~/.local/bin (no sudo)
+  if command -v car-pad >/dev/null 2>&1; then return 0; fi
+  if ! command -v go >/dev/null 2>&1; then
+    log "Go is not installed; cannot build car-pad. Install Go (brew/apt/dnf/pacman) then re-run."
+    return 1
+  fi
+
+  local BIN="$HOME/.local/bin"
+  mkdir -p "$BIN"
+  local TMP; TMP="$(mktemp -d)"
+  log "Building car-pad from fork (no sudo)..."
+  git clone --depth 1 https://github.com/kacperzuk-neti/go-car "$TMP/go-car" || { rm -rf "$TMP"; return 1; }
+  (
+    cd "$TMP/go-car/cmd/car" && \
+    go build -trimpath -ldflags "-s -w" -o "$BIN/car-pad" .
+  ) || { rm -rf "$TMP"; return 1; }
+  rm -rf "$TMP"
+  chmod +x "$BIN/car-pad"
+  export PATH="$BIN:$PATH"
+  log "Installed car-pad -> $BIN/car-pad"
+  return 0
 }
 
 install_deps() {
@@ -163,8 +187,12 @@ install_deps() {
       ;;
   esac
 
-  # Ensure a CAR extractor exists (user-space installs; no sudo)
+  # ensure at least one extractor exists; prefer the tolerant fork
+  ensure_kcar_installed || true
   ensure_extractor_installed || fail "Could not install a CAR extractor (car or ipfs-car)."
+  if ! (command -v car-pad >/dev/null || command -v car >/dev/null || command -v ipfs-car >/dev/null); then
+    fail "No CAR extractor available. Install Go and re-run --install-deps to build car-pad."
+  fi
 
   # Final checks
   have curl || fail "curl missing after install attempts."
@@ -247,67 +275,56 @@ PY
 unpack_car() {
   local carpath="$1"
   [[ -f "$carpath" ]] || {
-    # be extension-agnostic
     if [[ "$carpath" == *.car && -f "${carpath%.car}" ]]; then carpath="${carpath%.car}";
     elif [[ -f "${carpath}.car" ]]; then carpath="${carpath}.car";
     else fail "CAR file not found: $carpath"; fi
   }
 
-  # Prefer ipfs-car if requested/available
-  if [[ "$PREFER_IPFS_CAR" == "1" ]] && have ipfs-car; then
-    log "Unpacking with ipfs-car (preferred) ..."
-    if ipfs-car unpack "$carpath" --output .; then return 0; fi
-    log "ipfs-car failed; trying go-car ..."
+  log "Unpacking CAR: $carpath"
+
+  # 1) Prefer the tolerant forked CLI
+  if command -v car-pad >/dev/null 2>&1; then
+    if car-pad x -f "$carpath"; then return 0; fi
+    log "car-pad failed; trying other extractors..."
   fi
 
-  # Try go-car first
-  if have car; then
+  # 2) Try upstream go-car
+  if command -v car >/dev/null 2>&1; then
     set +e
     local out; out="$(car x -f "$carpath" 2>&1)"; local rc=$?
     set -e
     if (( rc == 0 )); then return 0; fi
+
+    # If it trips on zero-length/padding, fix safely (clone + truncate) then retry
     if grep -qiE 'ZeroLengthSectionAsEOF|zero length|null padding' <<<"$out"; then
-      log "Found zero-length section/padding. Fixing safely (clone + truncate) ..."
+      log "Detected zero-length section/padding. Fixing safely (clone + truncate)…"
       local offset; offset="$(find_zero_len_offset "$carpath" || true)"
       [[ -n "$offset" ]] || fail "Could not locate EOF marker in CAR; aborting."
       local fixed="${carpath}.fixed.car"
       safe_clone "$carpath" "$fixed"
       truncate -s "$offset" "$fixed"
-      log "Retrying extraction from fixed clone: $fixed"
-      car x -f "$fixed" || fail "Extraction failed even after fix (go-car)."
+      car x -f "$fixed" || fail "Extraction failed after fix (go-car)."
       return 0
     fi
+
     printf '%s\n' "$out" >&2
-    # If go-car failed for some other reason, try ipfs-car as a fallback
-    if have ipfs-car; then
-      log "go-car failed; trying ipfs-car ..."
-      ipfs-car unpack "$carpath" --output . || fail "ipfs-car extraction failed."
-      return 0
-    fi
-    return $rc
   fi
 
-  # No go-car; try ipfs-car
-  if have ipfs-car; then
-    set +e
-    local out; out="$(ipfs-car unpack "$carpath" --output . 2>&1)"; local rc=$?
-    set -e
-    if (( rc == 0 )); then return 0; fi
-    if grep -qiE 'Invalid CAR section \(zero length\)|zero length' <<<"$out"; then
-      log "ipfs-car complained about zero-length section. Fixing safely (clone + truncate) ..."
-      local offset; offset="$(find_zero_len_offset "$carpath" || true)"
-      [[ -n "$offset" ]] || fail "Could not locate EOF marker in CAR; aborting."
-      local fixed="${carpath}.fixed.car"
-      safe_clone "$carpath" "$fixed"
-      truncate -s "$offset" "$fixed"
-      ipfs-car unpack "$fixed" --output . || fail "Extraction failed even after fix (ipfs-car)."
-      return 0
-    fi
-    printf '%s\n' "$out" >&2
-    return $rc
+  # 3) Fallback to ipfs-car if present
+  if command -v ipfs-car >/dev/null 2>&1; then
+    if ipfs-car unpack "$carpath" --output .; then return 0; fi
+    # Apply the same safe fix for zero-length, then retry
+    log "ipfs-car failed; attempting safe truncate and retry…"
+    local offset; offset="$(find_zero_len_offset "$carpath" || true)"
+    [[ -n "$offset" ]] || fail "Could not locate EOF marker in CAR; aborting."
+    local fixed="${carpath}.fixed.car"
+    safe_clone "$carpath" "$fixed"
+    truncate -s "$offset" "$fixed"
+    ipfs-car unpack "$fixed" --output . || fail "Extraction failed after fix (ipfs-car)."
+    return 0
   fi
 
-  fail "No CAR extractor found."
+  fail "No working extractor available (tried car-pad, car, ipfs-car)."
 }
 
 # ---------- Arg parse ----------
