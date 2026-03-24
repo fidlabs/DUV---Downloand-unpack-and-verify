@@ -1,183 +1,268 @@
-# DUV---Downloand-unpack-and-verify
-# Description
+# DUV — Download, unpack, and verify (Filecoin)
 
-A single, no-sudo CLI to:
-- Create a job against `api.sp-tool.allocator.tech`, poll until ready, fetch the **first** CAR URL, download, and unpack it.
-- Or **unpack an already-downloaded** CAR file safely (keeps your original intact).
-- Optionally install required tooling **without sudo** (macOS: with Homebrew; user‑space installs for `ipfs-car` via npm and `car` via Go).
+Tools for **retrieving data from Filecoin storage providers** using **piece CIDs**, **deal metadata from [filecoin.tools](https://filecoin.tools)**, and optionally the **[SP Tool allocator API](https://api.sp-tool.allocator.tech)**. This repo also includes a **safe CAR unpack** path that avoids mutating your original download.
 
-> The script never runs Homebrew with `sudo` and will not use `sudo` at all. It favors **user-space** installs.
+Primary goals:
+
+- Resolve **`http(s)://<host>:<port>/piece/<pieceCid>`** when you know (or discover) the miner.
+- Prefer **filecoin.tools** for “which SPs hold this piece?” style lookups instead of relying on IPNI for that step.
+- **Unpack** padded or tricky CARv1 files without destroying the source file.
 
 ---
 
-## Features
+## Repository layout
 
-- **End-to-end flow:** POST job → poll `jobs/{id}` → fallback to synchronous endpoint → download first URL → unpack.
-- **Unpack‑only mode:** Works on files saved **with or without** `.car` extension.
-- **Resilient CAR unpack:** Handles CARv1 **zero-length section/padding** by making a **copy-on-write clone** and truncating at the exact EOF marker, then unpacking the **clone**.
-- **Dependency bootstrap (no sudo):** Installs `ipfs-car` (npm global with user prefix if needed) or `car` (`go install`) into `~/go/bin` or `~/.npm-global/bin`.
-- **macOS ready:** Uses APFS `cp -c` for instant cloning (no data copy). On Linux, tries `cp --reflink=always` (XFS/Btrfs); otherwise requires `ALLOW_COPY=1`.
-- **Only the first file** is downloaded/unpacked by design.
+| File | Role |
+|------|------|
+| [`sp-tool-fetch.sh`](#sp-tool-fetchsh) | Allocator API → job or sync URL → download CAR → unpack (or unpack-only / install-deps). |
+| [`cid-to-download.sh`](#cid-to-downloadsh) | Piece CID → provider discovery → SP HTTP bases → build `/piece/…` URLs → print or download (optional sp-tool). |
+| [`cid-sp-fetch.sh`](#cid-sp-fetchsh) | filecoin.tools search → **random** deal → same SP, direct `/piece/<cid>` download (optional allocator modes). |
+| [`cid-all-sp-piece-urls.sh`](#cid-all-sp-piece-urlssh) | filecoin.tools **all pages** → **every unique SP** → JSON list of endpoints and piece URLs. |
+| [`lib_piece_endpoints.sh`](#lib_piece_endpointssh) | Shared: Lotus `StateMinerInfo` + cid.contact + Lotus multiaddr decode → HTTP base URLs. **Not run directly.** |
+
+---
+
+## How the pieces fit together
+
+You usually work with a **piece CID** (often a `baga…` string). Retrieval over HTTP is commonly:
+
+```text
+{providerBase}/piece/{pieceCid}
+```
+
+where `providerBase` is something like `http://203.0.113.10:3105`.
+
+```mermaid
+flowchart LR
+  subgraph inputs
+    CID[piece CID]
+    C[f03643399 client]
+    P[f03175168 provider]
+  end
+
+  subgraph apis
+    FT[filecoin.tools API]
+    L[Lotus RPC e.g. Glif]
+    CC[cid.contact providers]
+    ST[sp-tool allocator API]
+  end
+
+  CID --> FT
+  FT -->|providerId + clientId| P
+  FT --> C
+
+  P --> L
+  L -->|PeerId| CC
+  CC -->|HTTP multiaddrs| EP[endpoint bases]
+  L -->|Multiaddrs fallback| EP
+
+  EP --> URL["/piece/CID"]
+  CID --> URL
+
+  C --> ST
+  P --> ST
+  ST -->|may return different piece| DL[download CAR]
+  URL --> DL2[direct download CAR]
+
+  DL --> UNPACK[sp-tool-fetch unpack]
+  DL2 --> UNPACK
+```
+
+**Important distinction**
+
+- **Direct `/piece/<yourCid>`** — Targets **that** piece on **that** miner (as long as the SP serves it on that base URL).
+- **`sp-tool-fetch.sh` / allocator** — Asks the service for **a** retrievable URL for the **client** (and optional provider). The returned CAR is **not guaranteed** to be the same piece CID you started with.
 
 ---
 
 ## Requirements
 
-- **Shell:** bash (macOS default is fine), `curl`, `jq`.
-- **Extractors:** one of `ipfs-car` (recommended) or `car` (from `go-car`). The script can install either in user space.
-- **Python 3:** used for fast CAR structure probing (no data scan). macOS usually has it; if not: `brew install python`.
-- **Optional:** `wget` (script falls back to `curl` if not present).
-
-> On Linux without sudo, you must already have `curl` and `jq` installed, or install them via your package manager. The script can still install `ipfs-car`/`car` in user space.
+| Need | Used by |
+|------|---------|
+| `bash`, `curl`, `jq` | All shell scripts |
+| `wget` or `curl` | Downloads (`cid-to-download`, `cid-sp-fetch` via `cid-to-download`, `sp-tool-fetch`) |
+| `python3` | `lib_piece_endpoints.sh` (decode Lotus base64 multiaddrs when cid.contact has no HTTP addrs) |
+| `storacha` CLI (optional) | `cid-to-download.sh` fallback if filecoin.tools has no row |
+| `car`, `ipfs-car`, and/or `car-pad` | `sp-tool-fetch.sh` unpack / `--install-deps` |
 
 ---
 
-## Quick start
+## `sp-tool-fetch.sh`
+
+End-to-end helper for the **allocator**: create a job (or poll the sync client URL), take the **first** `http(s)` URL from the response, download, then unpack.
+
+### Modes
+
+1. **Install dependencies** (no sudo; macOS uses Homebrew for system packages, user-space for car tooling where possible).
+2. **Fetch + unpack** — `--client` required; `--provider` optional to narrow miners.
+3. **Unpack only** — No network; safe clone + optional truncate + extract.
+
+### Usage
 
 ```bash
-# 1) Make the script executable
 chmod +x sp-tool-fetch.sh
 
-# 2) (Optional) Install deps in user space (no sudo)
-./sp-tool-fetch.sh --install-deps --os macos   # macOS (requires Homebrew to be present)
-# Linux (no sudo): the script can install ipfs-car/car for your user; ensure curl & jq exist
+# Dependencies (optional)
+./sp-tool-fetch.sh --install-deps --os macos
+./sp-tool-fetch.sh --install-deps --os debian --install-deps-only
 
-# 3) End-to-end run: fetch and unpack FIRST URL into a work dir
-./sp-tool-fetch.sh --client CLIENT_ID --dir DIRECTORY_TO_UNPACK
-# optionally narrow to one provider
-./sp-tool-fetch.sh --client CLIENT_ID --provider PROVIDER_ID --dir DIRECTORY_TO_UNPACK
+# Allocator → download → unpack
+./sp-tool-fetch.sh --client f03643399 --dir ./output
+./sp-tool-fetch.sh --client f03643399 --provider f03175168 --dir ./output
 
-# 4) Unpack a previously downloaded file (original stays intact)
-./sp-tool-fetch.sh --unpack-only ./DIRECTORY_TO_UNPACK/FILE[.car]
+# Unpack a file you already have (original never modified in place)
+./sp-tool-fetch.sh --unpack-only ./output/myfile.car --dir ./output
+```
+
+### Notable flags and environment
+
+| Flag / env | Meaning |
+|------------|---------|
+| `--api-base URL` / `API_BASE` | Default `https://api.sp-tool.allocator.tech` |
+| `--timeout` / `POLL_TIMEOUT` | Async job poll limit (default 900s) |
+| `--sync-timeout` / `SYNC_TIMEOUT` | Sync GET poll limit (default 900s) |
+| `PREFER_IPFS_CAR=1` | Prefer `ipfs-car` for unpack |
+| `ALLOW_COPY=1` / `--allow-copy` | Allow full copy if reflink/APFS clone unsupported |
+
+On **HTTP 405** from `POST /job`, the script **falls back** to polling `GET …/url/client/{client}` until a URL appears.
+
+---
+
+## `cid-to-download.sh`
+
+Resolve **direct piece retrieval URLs** for a **piece CID**, optionally download.
+
+### Flow
+
+1. **Find a provider** (unless `--provider` is set):  
+   `GET https://api.filecoin.tools/api/search?filter=<pieceCid>` (first hit), then optional **storacha**, then optional **cid.contact** `/cid/…`.
+2. **Resolve HTTP bases** for that miner (via `lib_piece_endpoints.sh`):  
+   cid.contact **provider** record → HTTP multiaddrs; if none, **Lotus** `StateMinerInfo.Multiaddrs` (base64 multiaddr → `http://ip:port`).
+3. Build **`{base}/piece/{pieceCid}`** for each base.
+4. **Print** one or all URLs, or **download** to `DIR/<pieceCid>.car`, trying **each** candidate URL until one succeeds.
+
+### Options
+
+| Option | Effect |
+|--------|--------|
+| `--url-only` | Print first URL (use with `--all-urls` to print every candidate line). |
+| `--download DIR` | Download into `DIR`; tries every built URL in order. |
+| `--provider f0…` | Skip filecoin.tools/storacha/cid lookup for provider; still resolves endpoints for that miner. |
+| `--client f0…` | Set client (for logging / `--use-sp-tool`). |
+| `--use-sp-tool` | With `--download` and client: run `sp-tool-fetch.sh` instead of direct URLs (piece may differ). |
+| `--no-filecoin-tools` | Skip filecoin.tools for step 1. |
+| `-h`, `--help` | Help. |
+
+### Examples
+
+```bash
+./cid-to-download.sh baga6ea4seaq… --url-only
+./cid-to-download.sh baga6ea4seaq… --all-urls --url-only
+./cid-to-download.sh baga6ea4seaq… --provider f03175168 --download ./out
 ```
 
 ---
 
-## Modes
+## `cid-sp-fetch.sh`
 
-### A) Dependency installation (no sudo)
+Convenience script: **filecoin.tools** paginated search with **`limit=10`**, **`page=1`**, pick **one random** row, then download **that** piece from **that** SP using the same direct `/piece/<cid>` logic as `cid-to-download.sh`.
+
+### Options
+
+| Option | Effect |
+|--------|--------|
+| *(default)* | Direct download; tries **all** HTTP bases for the chosen SP before failing. |
+| `--sp-tool` | Skip direct URLs; only `sp-tool-fetch.sh` for that client+provider. |
+| `--sp-fallback` | If every direct URL fails, run `sp-tool-fetch.sh` (**may fetch a different piece**). |
+
 ```bash
-./sp-tool-fetch.sh --install-deps [--os macos|debian|fedora|arch|windows] [--install-deps-only]
+./cid-sp-fetch.sh baga6ea4seaq… ./output
+./cid-sp-fetch.sh --sp-fallback baga6ea4seaq… ./output
+./cid-sp-fetch.sh --sp-tool baga6ea4seaq… ./output
 ```
-- **macOS:** uses Homebrew without sudo (must already be installed). Installs `jq`, `wget`, `go`, `node`.
-- **Linux:** package installs without sudo are not possible; the script still attempts user-space installs for `ipfs-car` and/or `car`.
-- **Windows:** prints manual install hints.
 
-### B) End-to-end (job → download → unpack)
+After a successful **direct** download, unpack with:
+
 ```bash
-./sp-tool-fetch.sh --client CLIENT_ID [--provider PROVIDER_ID] --dir DIR [--api-base URL]                    [--timeout SECONDS] [--sync-timeout SECONDS]
-```
-
-### C) Unpack an existing file (safe)
-```bash
-./sp-tool-fetch.sh --unpack-only /path/to/file[.car] [--dir DIR]
-```
-- The script creates an **instant clone** on APFS/Btrfs/XFS and truncates the clone at the CAR EOF marker. Your original is never modified.
-- On filesystems without clone/reflink support, set `ALLOW_COPY=1` to allow a regular copy.
-
----
-
-## Arguments
-
-- `--client CLIENT_ID` *(required for end-to-end)*  
-- `--provider PROVIDER_ID` *(optional)*  
-- `--dir DIR` *(required for end-to-end; optional for unpack-only)*  
-- `--api-base URL` (default: `https://api.sp-tool.allocator.tech`)  
-- `--timeout SECONDS` (poll timeout for async job; default `900`)  
-- `--sync-timeout SECONDS` (poll timeout for sync endpoint; default `900`)  
-- `--install-deps` (attempt user-space installs)  
-- `--install-deps-only` (install and exit)  
-- `--unpack-only PATH` (skip network; only unpack this file)  
-- `--os macos|debian|fedora|arch|windows` (hint for dependency phase)  
-- `--allow-copy` (allow real copy if clone/reflink unsupported; uses disk space/time)
-
----
-
-## Environment variables
-
-- `API_BASE` – override API base.  
-- `POLL_INTERVAL` – initial poll interval seconds (default `2`).  
-- `POLL_MAX_INTERVAL` – cap for backoff (default `15`).  
-- `POLL_TIMEOUT` – async job poll limit seconds (default `900`).  
-- `SYNC_TIMEOUT` – sync endpoint poll limit seconds (default `900`).  
-- `PREFER_IPFS_CAR=1` – prefer `ipfs-car unpack` over `car x`. Recommended for padded CARs.  
-- `ALLOW_COPY=1` – permit a regular copy when cloning is unsupported.  
-- `OS_FAMILY` – preset OS for installer (`macos|debian|fedora|arch|windows`).
-
-To make the npm user prefix permanent (so `ipfs-car` stays on PATH):
-```bash
-echo 'export PATH="$HOME/.npm-global/bin:$PATH"' >> ~/.zshrc
-source ~/.zshrc
+./sp-tool-fetch.sh --unpack-only ./output/baga6ea4seaq….car --dir ./output
 ```
 
 ---
 
-## How unpack safety works
+## `cid-all-sp-piece-urls.sh`
 
-- The script **never modifies your original file**. It:
-  1. **Probes** the CAR structure to find the **first zero-length section** (the EOF marker) using varints (fast; does not scan gigabytes).
-  2. Makes a **copy-on-write clone** (`cp -c` on APFS; `cp --reflink=always` on Btrfs/XFS).  
-     If unsupported and `ALLOW_COPY=1` is set, it performs a real copy.
-  3. **Truncates the clone** at the marker.  
-  4. Unpacks from the **clone** using `car` or `ipfs-car`.
+Enumerate **every unique `providerId`** returned by filecoin.tools for a piece CID (**paginated** search), then for **each** SP output structured JSON with **all** resolved `providerEndpoint` + `pieceUrl` pairs.
 
-This resolves “null padding not allowed” / “Invalid CAR section (zero length)” errors without redownloading.
+### Output shape
+
+```json
+{
+  "data": [
+    {
+      "providerId": "f03175168",
+      "pieceUrls": [
+        {
+          "providerEndpoint": "http://203.0.113.1:3105",
+          "pieceUrl": "http://203.0.113.1:3105/piece/baga6ea4seaq…"
+        }
+      ]
+    }
+  ]
+}
+```
+
+If an SP has **no** resolvable HTTP base, it still appears with `"pieceUrls": []`.
+
+### Options and environment
+
+| Option / env | Effect |
+|--------------|--------|
+| `-c`, `--compact` | Single-line JSON. |
+| `FILECOIN_TOOLS_API` | API base (default `https://api.filecoin.tools/api`). |
+| `SEARCH_PAGE_LIMIT` | Page size (default `100`). |
+| `LOTUS_RPC`, `CID_CONTACT_BASE` | Same as `cid-to-download.sh` / library. |
+
+```bash
+./cid-all-sp-piece-urls.sh baga6ea4seaq… | jq .
+./cid-all-sp-piece-urls.sh -c baga6ea4seaq…
+```
+
+**Performance:** One Lotus (+ optional cid.contact) round trip **per unique provider**; large replication counts can be slow.
+
+---
+
+## `lib_piece_endpoints.sh`
+
+Sourced by `cid-to-download.sh` and `cid-all-sp-piece-urls.sh`. Defines:
+
+- `get_miner_info <f0miner>` — POST Lotus `Filecoin.StateMinerInfo`.
+- `get_provider_http_endpoints_from_cid_contact <peerId>` — GET `https://cid.contact/providers/<peerId>`, parse `/ip4/…/tcp/…/http(s)` style multiaddrs.
+- `get_provider_http_endpoints_from_lotus <minerInfoJson>` — Decode base64 multiaddrs to `http://ip:port`.
+
+Defaults: `LOTUS_RPC=https://api.node.glif.io/rpc/v1`, `CID_CONTACT_BASE=https://cid.contact`. Override before sourcing or via environment when invoking the parent scripts.
+
+---
+
+## Choosing a workflow
+
+| Goal | Suggested path |
+|------|----------------|
+| “Get **this** piece from **one** random replica” | `cid-sp-fetch.sh <cid> ./out` |
+| “List **all** SPs and **all** `/piece/` URLs as JSON” | `cid-all-sp-piece-urls.sh <cid>` |
+| “I already know **f0provider**” | `cid-to-download.sh <cid> --provider f0… --download ./out` |
+| “Use allocator / Fil+ tooling only” | `sp-tool-fetch.sh --client f0… [--provider f0…] --dir ./out` |
+| “Unpack only” | `sp-tool-fetch.sh --unpack-only ./file.car` |
 
 ---
 
 ## Troubleshooting
 
-- **`HTTP 405` on POST /job**  
-  The script falls back to the synchronous endpoint and polls until a URL is available.
-
-- **Sync endpoint returns “Success” or no URL**  
-  The script polls until it extracts the first `http(s)` URL from the JSON.
-
-- **File saved without `.car` extension**  
-  `--unpack-only` accepts files with or without `.car`. It will try both forms automatically.
-
-- **`Invalid CAR section (zero length)` or `null padding not allowed`**  
-  Use `--unpack-only` (or the end-to-end flow) with `PREFER_IPFS_CAR=1`.  
-  If both extractors complain, the script clones and truncates the file at the EOF marker, then retries.
-
-- **“Fast clone unsupported”**  
-  Set `ALLOW_COPY=1` to allow a real copy (uses disk space/time).  
-  Example: `ALLOW_COPY=1 ./sp-tool-fetch.sh --unpack-only ./file`
-
-- **`command not found: ipfs-car` / `car`**  
-  Run `./sp-tool-fetch.sh --install-deps --os macos` (or your OS).  
-  Or install manually: `npm i -g ipfs-car` (user prefix) / `go install github.com/ipld/go-car/cmd/car@latest`.
-
-- **`jq` or `curl` missing**  
-  macOS: `brew install jq curl`.  
-  Linux: install via your package manager (may require sudo).
-
----
-
-## Examples
-
-```bash
-# Install deps, then run
-./sp-tool-fetch.sh --install-deps --os macos
-./sp-tool-fetch.sh --client f0CLIENT --dir 410_3
-
-# With provider narrowed
-./sp-tool-fetch.sh --client f0CLIENT --provider f0PROVIDER --dir 410_3
-
-# Unpack an existing file (prefer ipfs-car)
-PREFER_IPFS_CAR=1 ./sp-tool-fetch.sh --unpack-only ./410_3/mydownloadedfile
-
-# If your filesystem lacks clone/reflink:
-ALLOW_COPY=1 ./sp-tool-fetch.sh --unpack-only ./410_3/FILE
-```
-
----
-
-## Notes
-
-- The script downloads only the **first** URL if multiple URLs are returned.
-- It prints HTTP codes and raw responses on failures for quick debugging.
-- Works best on macOS APFS and Linux filesystems with reflink support.
+- **404 on `/piece/…` for one base** — `cid-to-download` / `cid-sp-fetch` try other bases for the same SP. Try another SP (`cid-sp-fetch` again) or inspect full list with `cid-all-sp-piece-urls.sh`.
+- **Allocator returns a different `baga…` than you asked for** — Expected: sync/job URL is **per client**, not per piece. Avoid `--sp-fallback` unless you accept that tradeoff.
+- **filecoin.tools search empty** — Wrong CID, or not indexed; try storacha (`cid-to-download` fallback) or another data source.
+- **No HTTP endpoints for a miner** — cid.contact empty and Lotus multiaddrs missing or undecodable; that SP may still be reachable via other tooling.
+- **CAR unpack errors (zero-length section / padding)** — Use `PREFER_IPFS_CAR=1` or let `sp-tool-fetch.sh` clone+truncate; see script comments and `--allow-copy` if clone fails.
+- **`jq` errors with URLs** — `cid-all-sp-piece-urls.sh` builds endpoint arrays with `--argjson` (not `--args`) for compatibility with various `jq` builds.
 
 ---
 
